@@ -171,6 +171,16 @@ def _convert_awq_to_standard_format(
     replace_parameter(layer, w_zp_name, new_zp_param)
 
 
+def _on_rdna() -> bool:
+    """True on ROCm RDNA (gfx1x), where choose_mp_linear_kernel offers the
+    RDNA3/RDNAHybrid W4A16 kernels."""
+    if not current_platform.is_rocm():
+        return False
+    from vllm.platforms.rocm import on_gfx1x
+
+    return on_gfx1x()
+
+
 class AutoAWQConfig(QuantizationConfig):
     """Config class for AutoAWQ quantization.
 
@@ -299,12 +309,15 @@ class AutoAWQConfig(QuantizationConfig):
             ):
                 return UnquantizedLinearMethod()
 
-            # On CPU and XPU, use the Marlin linear method which uses
+            # On CPU, XPU and RDNA, use the Marlin linear method which uses
             # choose_mp_linear_kernel to select the best available kernel
-            # (CPUWNA16LinearKernel on CPU, XPUwNa16LinearKernel on XPU).
-            # The AWQ checkpoint is converted to the standard GPTQ-like format
-            # in process_weights_after_loading before being handed to the kernel.
-            if current_platform.is_cpu() or current_platform.is_xpu():
+            # (CPUWNA16LinearKernel on CPU, XPUwNa16LinearKernel on XPU,
+            # RDNAHybridW4A16LinearKernel on RDNA). The AWQ checkpoint is
+            # converted to the standard GPTQ-like format in
+            # process_weights_after_loading before being handed to the kernel.
+            # Other ROCm targets (CDNA/gfx9) keep the legacy AWQ kernels because
+            # their MP kernels have not been measured for AWQ checkpoints.
+            if current_platform.is_cpu() or current_platform.is_xpu() or _on_rdna():
                 return AutoAWQMarlinLinearMethod(self)
 
             # Check if Marlin is supported and not using batch invariant mode
@@ -406,9 +419,10 @@ class AutoAWQMarlinLinearMethod(LinearMethodBase):
         self.quant_type = scalar_types.uint4
         self.input_dtype = None
 
-        # Skip Marlin verification on CPU/XPU - they use dedicated WNA16
-        # kernels (CPUWNA16LinearKernel / XPUwNa16LinearKernel) instead.
-        if not (current_platform.is_cpu() or current_platform.is_xpu()):
+        # Skip Marlin verification on CPU/XPU/RDNA - they use dedicated WNA16
+        # or W4A16 kernels instead of the CUDA Marlin kernels. This gate matches
+        # the one in get_quant_method, so no platform reaches a Marlin-only check.
+        if not (current_platform.is_cpu() or current_platform.is_xpu() or _on_rdna()):
             verify_marlin_supported(
                 quant_type=self.quant_config.quant_type,
                 group_size=self.quant_config.group_size,
